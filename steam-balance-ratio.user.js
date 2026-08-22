@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 市场货币换算与挂刀比例
 // @namespace    https://github.com/hitazuki/steam-balance-ratio-userscript
-// @version      0.2.1
+// @version      0.2.2
 // @description  使用 Steam 自身的货币换算，在饰品挂单旁显示目标货币金额和税后挂刀比例。
 // @author       hitazuki
 // @license      MIT
@@ -11,6 +11,7 @@
 // @compatible   edge
 // @compatible   firefox
 // @match        https://steamcommunity.com/market/listings/*/*
+// @match        https://steamcommunity.com/market/
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -100,12 +101,28 @@
     return "bad";
   }
 
+  function marketItemFromUrl(value) {
+    if (typeof value !== "string" || !value) return null;
+    try {
+      const url = new URL(value, "https://steamcommunity.com");
+      const match = url.pathname.match(/^\/market\/listings\/(\d+)\/(.+)$/);
+      if (!match) return null;
+      return {
+        appid: match[1],
+        marketHashName: decodeURIComponent(match[2])
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
   // Allow dependency-free Node tests to import the pure calculation helpers.
   if (typeof document === "undefined" && typeof module !== "undefined" && module.exports) {
     module.exports = {
       calculateQuote,
       calculateSteamRate,
       currencyCodeFromId,
+      marketItemFromUrl,
       parsePrice,
       ratioClass
     };
@@ -116,6 +133,7 @@
   let renderTimer = null;
   let observer = null;
   const steamRates = new Map();
+  const steamLowestQuotes = new Map();
   const rateStates = new Map();
 
   function loadSettings() {
@@ -136,20 +154,25 @@
     GM_setValue(SETTINGS_KEY, settings);
   }
 
-  function itemKey() {
-    const match = location.pathname.match(/^\/market\/listings\/(\d+)\/(.+)$/);
-    if (!match) return location.pathname;
-    return `${match[1]}:${decodeURIComponent(match[2])}`;
-  }
-
   function marketItem() {
-    const match = location.pathname.match(/^\/market\/listings\/(\d+)\/(.+)$/);
-    if (!match) return null;
-    return { appid: match[1], marketHashName: decodeURIComponent(match[2]) };
+    return marketItemFromUrl(location.href);
   }
 
-  function buyPriceKey(targetCurrency) {
-    return `${SCRIPT_ID}:buy:${itemKey()}:${targetCurrency}`;
+  function marketItemFromRow(row) {
+    const link = row.querySelector('a[href*="/market/listings/"]');
+    return marketItemFromUrl(link?.href || "");
+  }
+
+  function rateItem() {
+    return marketItem() || marketItemFromRow(document.querySelector(
+      '#tabContentsMyActiveMarketListingsRows .market_listing_row, '
+      + '#myListings .market_listing_row[id^="mylisting_"]'
+    ) || document.body);
+  }
+
+  function buyPriceKey(targetCurrency, item = marketItem()) {
+    if (!item) return null;
+    return `${SCRIPT_ID}:buy:${item.appid}:${item.marketHashName}:${targetCurrency}`;
   }
 
   function detectCurrency() {
@@ -174,9 +197,28 @@
     return { code: settings.manualSourceCurrency, detected: false, walletId: null };
   }
 
-  function currentBuyPrice(target) {
-    const value = Number(GM_getValue(buyPriceKey(target), ""));
+  function currentBuyPrice(target, item = marketItem()) {
+    const key = buyPriceKey(target, item);
+    if (!key) return null;
+    const value = Number(GM_getValue(key, ""));
     return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  function sellerNetFromGross(gross) {
+    if (!Number.isFinite(gross) || gross <= 0) return null;
+    if (typeof pageWindow.CalculateFeeAmount !== "function") return null;
+    const publisherFee = Number(
+      pageWindow.g_rgWalletInfo?.wallet_publisher_fee_percent_default ?? 0.1
+    );
+    try {
+      const grossMinor = Math.round(gross * 100);
+      const fees = pageWindow.CalculateFeeAmount(grossMinor, publisherFee);
+      if (!fees || !Number.isFinite(Number(fees.fees))) return null;
+      const netMinor = grossMinor - Number(fees.fees);
+      return netMinor > 0 ? netMinor / 100 : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   function formatMoney(value, currency) {
@@ -208,20 +250,28 @@
   async function loadSteamRate(targetCurrency, currency) {
     const key = rateKey(currency.code, targetCurrency);
     const existing = rateStates.get(key);
-    if (existing === "loading" || existing === "ready") return;
-    if (currency.code === targetCurrency) {
+    const sameCurrency = currency.code === targetCurrency;
+    const detailItem = marketItem();
+    if (existing === "loading") return;
+    if (existing === "ready" && (!detailItem || steamLowestQuotes.has(key))) return;
+    if (sameCurrency) {
       steamRates.set(key, 1);
-      rateStates.set(key, "ready");
-      updateConversionHint(targetCurrency, `Steam ${targetCurrency} 无需换算`);
-      renderRows(currency);
-      return;
     }
     const sourceCurrencyId = CURRENCY_ID_BY_CODE[currency.code];
     const targetCurrencyId = CURRENCY_ID_BY_CODE[targetCurrency];
-    const item = marketItem();
-    if (!sourceCurrencyId || !targetCurrencyId || !item) {
+    const item = rateItem();
+    if (!sourceCurrencyId || !targetCurrencyId) {
       rateStates.set(key, "error");
       updateConversionHint(targetCurrency, "无法构造 Steam 货币换算请求", true);
+      return;
+    }
+    if (!item) {
+      rateStates.set(key, sameCurrency ? "ready" : "pending");
+      updateConversionHint(
+        targetCurrency,
+        sameCurrency ? `Steam ${targetCurrency} 无需换算` : "正在等待已上架物品数据…"
+      );
+      renderRows(currency);
       return;
     }
 
@@ -237,17 +287,26 @@
         url.searchParams.set("currency", String(currencyId));
         return url;
       };
-      const [sourceResponse, targetResponse] = await Promise.all([
-        fetch(priceUrl(sourceCurrencyId), { credentials: "include" }),
-        fetch(priceUrl(targetCurrencyId), { credentials: "include" })
-      ]);
-      if (!sourceResponse.ok || !targetResponse.ok) {
-        throw new Error(`HTTP ${sourceResponse.status}/${targetResponse.status}`);
+      let sourceData;
+      let targetData;
+      if (sameCurrency) {
+        const response = await fetch(priceUrl(sourceCurrencyId), { credentials: "include" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        sourceData = await response.json();
+        targetData = sourceData;
+      } else {
+        const [sourceResponse, targetResponse] = await Promise.all([
+          fetch(priceUrl(sourceCurrencyId), { credentials: "include" }),
+          fetch(priceUrl(targetCurrencyId), { credentials: "include" })
+        ]);
+        if (!sourceResponse.ok || !targetResponse.ok) {
+          throw new Error(`HTTP ${sourceResponse.status}/${targetResponse.status}`);
+        }
+        [sourceData, targetData] = await Promise.all([
+          sourceResponse.json(),
+          targetResponse.json()
+        ]);
       }
-      const [sourceData, targetData] = await Promise.all([
-        sourceResponse.json(),
-        targetResponse.json()
-      ]);
       const sourcePrice = parsePrice(sourceData.lowest_price || "", currency.code);
       const targetPrice = parsePrice(targetData.lowest_price || "", targetCurrency);
       if (!sourceData.success || !targetData.success || !sourcePrice || !targetPrice) {
@@ -256,10 +315,19 @@
       const rate = calculateSteamRate(sourcePrice, targetPrice);
       if (!rate) throw new Error("Steam 换算率无效");
       steamRates.set(key, rate);
+      const sourceNet = sellerNetFromGross(sourcePrice);
+      steamLowestQuotes.set(key, {
+        itemKey: `${item.appid}:${item.marketHashName}`,
+        sourceGross: sourcePrice,
+        targetGross: targetPrice,
+        targetNet: Number.isFinite(sourceNet) ? sourceNet * rate : null
+      });
       rateStates.set(key, "ready");
       updateConversionHint(
         targetCurrency,
-        `Steam 换算：1 ${currency.code} ≈ ${rate.toFixed(6)} ${targetCurrency}`
+        sameCurrency
+          ? `Steam ${targetCurrency} 无需换算`
+          : `Steam 换算：1 ${currency.code} ≈ ${rate.toFixed(6)} ${targetCurrency}`
       );
     } catch (error) {
       rateStates.set(key, "error");
@@ -294,7 +362,9 @@
 
   function findPriceHost(row, currencyCode) {
     const standard = row.querySelector(".market_listing_their_price .market_table_value")
-      || row.querySelector(".market_listing_their_price");
+      || row.querySelector(".market_listing_their_price")
+      || row.querySelector(".market_listing_my_price .market_table_value")
+      || row.querySelector(".market_listing_my_price");
     if (standard) return standard;
 
     // Steam Inventory Helper can replace the original price spans and wrappers.
@@ -346,7 +416,9 @@
         color: #66c0f4; background: #101923; border: 1px solid #344c61; border-radius: 3px;
       }
       #${SCRIPT_ID}-toolbar .${SCRIPT_ID}-hint { align-self: center; color: #8f98a0; font-size: 12px; }
-      #searchResultsRows .market_listing_row { position: relative; }
+      #searchResultsRows .market_listing_row,
+      #tabContentsMyActiveMarketListingsRows .market_listing_row,
+      #myListings .market_listing_row[id^="mylisting_"] { position: relative; }
       .${SCRIPT_ID}-result {
         box-sizing: border-box; position: absolute; z-index: 2; top: 50%; right: 350px;
         width: 190px; transform: translateY(-50%); display: grid;
@@ -375,6 +447,45 @@
       .${SCRIPT_ID}-result.${SCRIPT_ID}-message {
         grid-template-columns: 1fr; text-align: center;
       }
+      .${SCRIPT_ID}-result.${SCRIPT_ID}-owned-result.${SCRIPT_ID}-message {
+        grid-template-columns: 1fr;
+      }
+      #${SCRIPT_ID}-lowest-fallback {
+        box-sizing: border-box; display: grid; grid-template-columns: 1fr auto;
+        gap: 8px 18px; margin: 10px 0; padding: 14px 16px;
+        color: #8f98a0; background: #101923; border: 1px solid #2a475e;
+        border-left: 3px solid #66c0f4; font: 13px/1.4 Arial, Helvetica, sans-serif;
+      }
+      #${SCRIPT_ID}-lowest-fallback .${SCRIPT_ID}-fallback-title {
+        color: #c7d5e0; font-size: 14px; font-weight: 600;
+      }
+      #${SCRIPT_ID}-lowest-fallback .${SCRIPT_ID}-fallback-values {
+        display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px;
+        font-variant-numeric: tabular-nums;
+      }
+      #${SCRIPT_ID}-lowest-fallback .${SCRIPT_ID}-fallback-note {
+        grid-column: 1 / -1; color: #71808d; font-size: 11px;
+      }
+      .${SCRIPT_ID}-result.${SCRIPT_ID}-owned-result {
+        right: auto; left: 18%; width: 240px; padding: 5px 8px;
+        grid-template-columns: 34px minmax(0, 1fr) 34px minmax(0, 1fr);
+        gap: 2px 6px;
+        pointer-events: auto;
+      }
+      .${SCRIPT_ID}-owned-result .${SCRIPT_ID}-result-title { display: none; }
+      .${SCRIPT_ID}-owned-result .${SCRIPT_ID}-ratio {
+        grid-column: auto; text-align: right;
+      }
+      .${SCRIPT_ID}-owned-buy {
+        box-sizing: border-box; width: 100%; min-width: 0; height: 18px;
+        padding: 0 4px; color: #fff; background: #0b141d;
+        border: 1px solid #344c61; border-radius: 2px;
+        font: 11px/18px Arial, Helvetica, sans-serif;
+        font-variant-numeric: tabular-nums;
+      }
+      .${SCRIPT_ID}-owned-buy:focus {
+        outline: none; border-color: #66c0f4;
+      }
       @media (max-width: 760px) {
         #${SCRIPT_ID}-toolbar { align-items: stretch; }
         #${SCRIPT_ID}-toolbar .${SCRIPT_ID}-field { flex: 1 1 140px; }
@@ -385,8 +496,13 @@
           gap: 2px 6px; padding: 5px 8px;
         }
         .${SCRIPT_ID}-result-title { display: none; }
+        .${SCRIPT_ID}-result.${SCRIPT_ID}-owned-result {
+          right: auto; left: 136px; width: 250px;
+        }
         .${SCRIPT_ID}-result .${SCRIPT_ID}-ratio-label { grid-column: 1; }
         .${SCRIPT_ID}-result .${SCRIPT_ID}-ratio { grid-column: 2 / -1; text-align: left; }
+        #${SCRIPT_ID}-lowest-fallback { grid-template-columns: 1fr; }
+        #${SCRIPT_ID}-lowest-fallback .${SCRIPT_ID}-fallback-note { grid-column: 1; }
       }
     `;
     document.head.appendChild(style);
@@ -396,8 +512,11 @@
     const existing = document.getElementById(`${SCRIPT_ID}-toolbar`);
     if (existing) return existing;
     const results = document.getElementById("searchResults")
-      || document.getElementById("searchResultsRows")?.parentElement;
+      || document.getElementById("searchResultsRows")?.parentElement
+      || document.getElementById("myListings")
+      || document.getElementById("tabContentsMyActiveMarketListings")?.parentElement;
     if (!results) return null;
+    const currentItem = marketItem();
 
     const toolbar = document.createElement("div");
     toolbar.id = `${SCRIPT_ID}-toolbar`;
@@ -414,13 +533,19 @@
           ${TARGET_CURRENCIES.map((code) => `<option value="${code}">${code}</option>`).join("")}
         </select>
       </div>
-      <div class="${SCRIPT_ID}-field">
-        <label for="${SCRIPT_ID}-buy">买入价（<span id="${SCRIPT_ID}-buy-code"></span>）</label>
-        <input id="${SCRIPT_ID}-buy" type="number" min="0" step="0.01" inputmode="decimal" placeholder="填写总成本">
-      </div>
+      ${currentItem ? `
+        <div class="${SCRIPT_ID}-field">
+          <label for="${SCRIPT_ID}-buy">买入价（<span id="${SCRIPT_ID}-buy-code"></span>）</label>
+          <input id="${SCRIPT_ID}-buy" type="number" min="0" step="0.01" inputmode="decimal" placeholder="填写总成本">
+        </div>
+      ` : ""}
       <div id="${SCRIPT_ID}-hint" class="${SCRIPT_ID}-hint"></div>
     `;
-    results.insertBefore(toolbar, results.firstChild);
+    if (results.id === "myListings") {
+      results.parentElement.insertBefore(toolbar, results);
+    } else {
+      results.insertBefore(toolbar, results.firstChild);
+    }
 
     const target = toolbar.querySelector(`#${SCRIPT_ID}-target`);
     const buy = toolbar.querySelector(`#${SCRIPT_ID}-buy`);
@@ -428,11 +553,14 @@
 
     function syncInputs() {
       const targetCode = target.value;
-      toolbar.querySelector(`#${SCRIPT_ID}-buy-code`).textContent = targetCode;
-      buy.value = currentBuyPrice(targetCode) ?? "";
+      const buyCode = toolbar.querySelector(`#${SCRIPT_ID}-buy-code`);
+      if (buyCode) buyCode.textContent = targetCode;
+      if (buy) buy.value = currentBuyPrice(targetCode, currentItem) ?? "";
       const state = rateStates.get(rateKey(currency.code, targetCode));
       toolbar.querySelector(`#${SCRIPT_ID}-hint`).textContent = state === "ready"
-        ? `使用 Steam 自身的 ${targetCode} 换算`
+        ? currentItem
+          ? `使用 Steam 自身的 ${targetCode} 换算`
+          : `使用 Steam 自身的 ${targetCode} 换算；可在各物品卡片填写买入价`
         : `正在获取 Steam 的 ${targetCode} 换算…`;
     }
 
@@ -443,34 +571,101 @@
       renderRows(currency);
       loadSteamRate(target.value, currency);
     });
-    buy.addEventListener("input", () => {
-      const value = Number(buy.value);
-      GM_setValue(buyPriceKey(target.value), Number.isFinite(value) && value > 0 ? value : "");
-      scheduleRender(currency);
-    });
+    if (buy) {
+      buy.addEventListener("input", () => {
+        const value = Number(buy.value);
+        const key = buyPriceKey(target.value, currentItem);
+        if (key) GM_setValue(key, Number.isFinite(value) && value > 0 ? value : "");
+        scheduleRender(currency);
+      });
+    }
     syncInputs();
     return toolbar;
+  }
+
+  function renderLowestFallback(currency, target, visibleListingCount) {
+    const id = `${SCRIPT_ID}-lowest-fallback`;
+    const existing = document.getElementById(id);
+    const item = marketItem();
+    const container = document.getElementById("searchResultsRows");
+    const emptyMessage = container?.textContent || "";
+    const confirmsEmpty = /不在货架|没有.*(?:出售|在售)|no listings|not.*listed/i.test(
+      emptyMessage
+    );
+    if (!item || !container || visibleListingCount > 0 || !confirmsEmpty) {
+      existing?.remove();
+      return;
+    }
+
+    const key = rateKey(currency.code, target);
+    const lowest = steamLowestQuotes.get(key);
+    if (!lowest || lowest.itemKey !== `${item.appid}:${item.marketHashName}`) {
+      existing?.remove();
+      return;
+    }
+
+    const buyPrice = currentBuyPrice(target, item);
+    const ratio = Number.isFinite(buyPrice) && buyPrice > 0
+      && Number.isFinite(lowest.targetNet) && lowest.targetNet > 0
+      ? buyPrice / lowest.targetNet * 100
+      : null;
+    const ratioText = Number.isFinite(ratio)
+      ? `${ratio.toFixed(2)}%`
+      : buyPrice
+        ? "税后价不可用"
+        : "未填买入价";
+    const signature = JSON.stringify([
+      lowest.targetGross, lowest.targetNet, buyPrice, target, ratio
+    ]);
+    const fallback = existing || document.createElement("div");
+    if (fallback.dataset.signature === signature) return;
+    fallback.id = id;
+    fallback.dataset.signature = signature;
+    fallback.innerHTML = `
+      <div class="${SCRIPT_ID}-fallback-title">无可见卖单 · Steam 最低价参考</div>
+      <div class="${SCRIPT_ID}-fallback-values">
+        <span>含费最低 <strong class="${SCRIPT_ID}-gross">${formatMoney(lowest.targetGross, target)}</strong></span>
+        <span>税后估算 <strong class="${SCRIPT_ID}-net">${formatMoney(lowest.targetNet, target)}</strong></span>
+        <span>挂刀 <strong class="${SCRIPT_ID}-ratio ${ratioClass(ratio)}">${ratioText}</strong></span>
+      </div>
+      <div class="${SCRIPT_ID}-fallback-note">
+        数据来自 Steam priceoverview；税后价按当前钱包手续费反推，卖单恢复后以实际挂单为准。
+      </div>
+    `;
+    if (!existing) container.insertBefore(fallback, container.firstChild);
   }
 
   function renderRows(currency) {
     const toolbar = document.getElementById(`${SCRIPT_ID}-toolbar`);
     if (!toolbar) return;
     const target = toolbar.querySelector(`#${SCRIPT_ID}-target`).value;
-    const buyPrice = currentBuyPrice(target);
     const key = rateKey(currency.code, target);
     const rate = steamRates.get(key);
     const state = rateStates.get(key) || "loading";
+    const visibleListingCount = document.querySelectorAll(
+      "#searchResultsRows .market_listing_row"
+    ).length;
 
-    document.querySelectorAll("#searchResultsRows .market_listing_row").forEach((row) => {
+    document.querySelectorAll(
+      "#searchResultsRows .market_listing_row, "
+      + "#tabContentsMyActiveMarketListingsRows .market_listing_row, "
+      + '#myListings .market_listing_row[id^="mylisting_"]'
+    ).forEach((row) => {
       const amounts = listingAmounts(row, currency.code);
       if (!amounts) return;
       const { gross, net } = amounts;
+      const owned = Boolean(row.closest(
+        "#tabContentsMyActiveMarketListingsRows, #myListings"
+      ));
+      const rowItem = marketItemFromRow(row) || marketItem();
+      const buyPrice = currentBuyPrice(target, rowItem);
       let result = row.querySelector(`:scope > .${SCRIPT_ID}-result`);
       if (!result) {
         result = document.createElement("div");
         result.className = `${SCRIPT_ID}-result`;
         row.appendChild(result);
       }
+      result.classList.toggle(`${SCRIPT_ID}-owned-result`, owned);
 
       const quote = Number.isFinite(rate)
         ? calculateQuote(gross * rate, net * rate, buyPrice)
@@ -493,17 +688,49 @@
         return;
       }
       result.classList.remove(`${SCRIPT_ID}-message`);
-      const ratioText = Number.isFinite(quote.ratio) ? `${quote.ratio.toFixed(2)}%` : "—";
-      result.innerHTML = `
-        <span class="${SCRIPT_ID}-result-title">${target} 折合</span>
-        <span class="${SCRIPT_ID}-result-label">含费</span>
-        <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-gross">${formatMoney(quote.convertedGross, target)}</span>
-        <span class="${SCRIPT_ID}-result-label">到账</span>
-        <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-net">${formatMoney(quote.convertedNet, target)}</span>
-        <span class="${SCRIPT_ID}-result-label ${SCRIPT_ID}-ratio-label">挂刀</span>
-        <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-ratio ${ratioClass(quote.ratio)}">${ratioText}</span>
-      `;
+      const ratioText = Number.isFinite(quote.ratio)
+        ? `${quote.ratio.toFixed(2)}%`
+        : "—";
+      if (owned) {
+        result.innerHTML = `
+          <span class="${SCRIPT_ID}-result-label">含费</span>
+          <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-gross">${formatMoney(quote.convertedGross, target)}</span>
+          <span class="${SCRIPT_ID}-result-label">到账</span>
+          <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-net">${formatMoney(quote.convertedNet, target)}</span>
+          <span class="${SCRIPT_ID}-result-label">买入</span>
+          <input class="${SCRIPT_ID}-owned-buy" type="number" min="0" step="0.01" inputmode="decimal" aria-label="${target} 买入价">
+          <span class="${SCRIPT_ID}-result-label">挂刀</span>
+          <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-ratio ${ratioClass(quote.ratio)}">${ratioText}</span>
+        `;
+        const buyInput = result.querySelector(`.${SCRIPT_ID}-owned-buy`);
+        const priceKey = buyPriceKey(target, rowItem);
+        buyInput.value = buyPrice ?? "";
+        buyInput.placeholder = priceKey ? "填写" : "无法识别";
+        buyInput.disabled = !priceKey;
+        buyInput.addEventListener("click", (event) => event.stopPropagation());
+        buyInput.addEventListener("keydown", (event) => {
+          event.stopPropagation();
+          if (event.key === "Enter") buyInput.blur();
+        });
+        buyInput.addEventListener("change", () => {
+          if (!priceKey) return;
+          const value = Number(buyInput.value);
+          GM_setValue(priceKey, Number.isFinite(value) && value > 0 ? value : "");
+          scheduleRender(currency);
+        });
+      } else {
+        result.innerHTML = `
+          <span class="${SCRIPT_ID}-result-title">${target} 折合</span>
+          <span class="${SCRIPT_ID}-result-label">含费</span>
+          <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-gross">${formatMoney(quote.convertedGross, target)}</span>
+          <span class="${SCRIPT_ID}-result-label">到账</span>
+          <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-net">${formatMoney(quote.convertedNet, target)}</span>
+          <span class="${SCRIPT_ID}-result-label ${SCRIPT_ID}-ratio-label">挂刀</span>
+          <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-ratio ${ratioClass(quote.ratio)}">${ratioText}</span>
+        `;
+      }
     });
+    renderLowestFallback(currency, target, visibleListingCount);
   }
 
   function scheduleRender(currency) {
@@ -529,6 +756,8 @@
     observer = new MutationObserver(() => {
       if (!document.getElementById(`${SCRIPT_ID}-toolbar`)) tryMount();
       scheduleRender(currency);
+      const target = document.getElementById(`${SCRIPT_ID}-target`)?.value;
+      if (target) loadSteamRate(target, currency);
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }

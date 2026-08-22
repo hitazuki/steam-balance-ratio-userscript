@@ -12,6 +12,14 @@ assert.equal(script.currencyCodeFromId(12), "PHP");
 assert.equal(script.currencyCodeFromId(5), "RUB");
 assert.equal(script.currencyCodeFromId(999), null);
 
+assert.deepEqual(
+  script.marketItemFromUrl(
+    "https://steamcommunity.com/market/listings/730/Fracture%20Case"
+  ),
+  { appid: "730", marketHashName: "Fracture Case" }
+);
+assert.equal(script.marketItemFromUrl("https://steamcommunity.com/market/"), null);
+
 assert.equal(script.parsePrice("P3757.93", "PHP"), 3757.93);
 assert.equal(script.parsePrice("₱3,757.93", "PHP"), 3757.93);
 assert.equal(script.parsePrice("3.757,93 €", "EUR"), 3757.93);

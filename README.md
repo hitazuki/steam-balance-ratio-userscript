@@ -1,7 +1,7 @@
 # Steam 市场货币换算与挂刀比例
 
-`steam-balance-ratio.user.js` 是一个无后端依赖的油猴脚本，只在浏览器版 Steam
-饰品详情页运行。它通过 Steam 市场 `priceoverview` 接口分别读取钱包货币与目标货币
+`steam-balance-ratio.user.js` 是一个无后端依赖的油猴脚本，在浏览器版 Steam
+饰品详情页和市场首页运行。它通过 Steam 市场 `priceoverview` 接口分别读取钱包货币与目标货币
 下的最低售价，由 Steam 返回值计算换算率，再换算每条挂单的买家含费价与卖家税后
 到账价。用户只需用目标货币填写买入价，不需要手填汇率。
 
@@ -12,7 +12,8 @@
    并点击“安装此脚本”；也可以从 [GitHub Raw 地址](https://raw.githubusercontent.com/hitazuki/steam-balance-ratio-userscript/main/steam-balance-ratio.user.js)
    直接安装。
 3. 登录浏览器版 Steam，打开形如
-   `https://steamcommunity.com/market/listings/730/...` 的饰品页面。
+   `https://steamcommunity.com/market/listings/730/...` 的饰品页面，或打开市场首页查看
+   “我正在出售的物品”。
 
 脚本优先通过 Steam 的 `g_rgWalletInfo.wallet_currency` 识别钱包货币。菲律宾比索的
 Steam 货币编号是 `12`，脚本会显示为 ISO 代码 `PHP`，不会根据页面中可能显示成 `P`
@@ -33,7 +34,16 @@ Steam 货币编号是 `12`，脚本会显示为 ISO 代码 `PHP`，不会根据�
 `appid + market_hash_name + 目标货币` 分别保存。脚本不请求第三方平台，不读取或保存
 Steam Cookie、会话令牌和钱包余额。
 
-当前版本只处理页面挂单列表，不修改求购区、历史图表或 Steam 客户端内置页面。
+市场首页的已上架列表会按物品读取此前保存的买入价并显示挂刀比例。也可以直接在
+每条折合卡片的“买入”输入框填写目标货币成本；相同物品共用该价格，任意一行保存后
+其他同名条目会同步更新。
+
+饰品详情页若暂时没有返回可见卖单，但 Steam `priceoverview` 仍提供最低售价，脚本会
+显示目标货币的最低含费价，并按当前钱包手续费反推税后估算价和挂刀比例。该结果会
+标记为参考值，卖单恢复后仍以实际挂单为准。
+
+当前版本处理饰品详情页挂单列表和市场首页已上架列表，不修改求购区、历史图表或
+Steam 客户端内置页面。
 
 ## 本地验证
 

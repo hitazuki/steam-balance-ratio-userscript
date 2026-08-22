@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 市场货币换算与挂刀比例
 // @namespace    https://github.com/hitazuki/steam-balance-ratio-userscript
-// @version      0.2.2
+// @version      0.2.3
 // @description  使用 Steam 自身的货币换算，在饰品挂单旁显示目标货币金额和税后挂刀比例。
 // @author       hitazuki
 // @license      MIT
@@ -38,6 +38,24 @@
   const CURRENCY_ID_BY_CODE = Object.freeze(Object.fromEntries(
     Object.entries(CURRENCY_BY_ID).map(([id, code]) => [code, Number(id)])
   ));
+  const NO_LISTING_MESSAGES = new Set([
+    "此物品不在货架上",
+    "目前无人挂出此物品",
+    "there are no listings currently available for this item",
+    "there are no listings for this item",
+    "this item is not currently listed"
+  ]);
+
+  function normalizeMessage(text) {
+    return typeof text === "string"
+      ? text.replace(/\s+/g, " ").trim().replace(/[。.!！]+$/, "").toLowerCase()
+      : "";
+  }
+
+  function isNoListingMessage(text) {
+    const normalized = normalizeMessage(text);
+    return [...NO_LISTING_MESSAGES].some((message) => normalized.includes(message));
+  }
 
   function currencyCodeFromId(id) {
     return CURRENCY_BY_ID[Number(id)] || null;
@@ -122,6 +140,7 @@
       calculateQuote,
       calculateSteamRate,
       currencyCodeFromId,
+      isNoListingMessage,
       marketItemFromUrl,
       parsePrice,
       ratioClass
@@ -156,6 +175,16 @@
 
   function marketItem() {
     return marketItemFromUrl(location.href);
+  }
+
+  function marketItemNameId() {
+    const tickerId = Number(pageWindow.ItemActivityTicker?.m_llItemNameID);
+    if (Number.isFinite(tickerId) && tickerId > 0) return String(tickerId);
+    for (const script of document.scripts) {
+      const match = script.textContent.match(/Market_LoadOrderSpread\(\s*(\d+)/);
+      if (match) return match[1];
+    }
+    return null;
   }
 
   function marketItemFromRow(row) {
@@ -239,12 +268,63 @@
     return `${sourceCurrency}/${targetCurrency}`;
   }
 
+  function cachedRateKey(sourceCurrency, targetCurrency) {
+    return `${SCRIPT_ID}:rate:${sourceCurrency}:${targetCurrency}`;
+  }
+
+  function cachedLowestKey(currencyCode, item) {
+    return item
+      ? `${SCRIPT_ID}:lowest:${currencyCode}:${item.appid}:${item.marketHashName}`
+      : null;
+  }
+
+  function readCachedRate(sourceCurrency, targetCurrency) {
+    if (sourceCurrency === targetCurrency) return 1;
+    const saved = GM_getValue(cachedRateKey(sourceCurrency, targetCurrency), null);
+    const rate = Number(saved?.rate);
+    return Number.isFinite(rate) && rate > 0 ? rate : null;
+  }
+
+  function readCachedLowest(currencyCode, item) {
+    const storageKey = cachedLowestKey(currencyCode, item);
+    if (!storageKey) return null;
+    const saved = GM_getValue(storageKey, null);
+    const gross = Number(saved?.gross);
+    return Number.isFinite(gross) && gross > 0 ? gross : null;
+  }
+
+  function writeCachedLowest(currencyCode, item, gross) {
+    const storageKey = cachedLowestKey(currencyCode, item);
+    if (!storageKey || !Number.isFinite(gross) || gross <= 0) return;
+    if (readCachedLowest(currencyCode, item) === gross) return;
+    GM_setValue(storageKey, { gross, updatedAt: Date.now() });
+  }
+
   function updateConversionHint(targetCurrency, text, isError = false) {
     const hint = document.getElementById(`${SCRIPT_ID}-hint`);
     const target = document.getElementById(`${SCRIPT_ID}-target`);
     if (!hint || target?.value !== targetCurrency) return;
     hint.textContent = text;
     hint.style.color = isError ? "#e35e5e" : "";
+  }
+
+  async function loadOrderBookLowest(currencyId, currencyCode) {
+    const itemNameId = marketItemNameId();
+    if (!itemNameId) return null;
+    const url = new URL("/market/itemordershistogram", location.origin);
+    url.searchParams.set("country", pageWindow.g_strCountryCode || "PH");
+    url.searchParams.set("language", pageWindow.g_strLanguage || "schinese");
+    url.searchParams.set("currency", String(currencyId));
+    url.searchParams.set("item_nameid", itemNameId);
+    url.searchParams.set("two_factor", "0");
+    const response = await fetch(url, { credentials: "include" });
+    if (!response.ok) throw new Error(`订单深度 HTTP ${response.status}`);
+    const data = await response.json();
+    if (!data?.success) return null;
+    const formatted = parsePrice(data.lowest_sell_order_formatted || "", currencyCode);
+    if (Number.isFinite(formatted) && formatted > 0) return formatted;
+    const graphPrice = Number(data.sell_order_graph?.[0]?.[0]);
+    return Number.isFinite(graphPrice) && graphPrice > 0 ? graphPrice : null;
   }
 
   async function loadSteamRate(targetCurrency, currency) {
@@ -256,6 +336,9 @@
     if (existing === "ready" && (!detailItem || steamLowestQuotes.has(key))) return;
     if (sameCurrency) {
       steamRates.set(key, 1);
+    } else if (!steamRates.has(key)) {
+      const cachedRate = readCachedRate(currency.code, targetCurrency);
+      if (cachedRate) steamRates.set(key, cachedRate);
     }
     const sourceCurrencyId = CURRENCY_ID_BY_CODE[currency.code];
     const targetCurrencyId = CURRENCY_ID_BY_CODE[targetCurrency];
@@ -307,21 +390,38 @@
           targetResponse.json()
         ]);
       }
-      const sourcePrice = parsePrice(sourceData.lowest_price || "", currency.code);
-      const targetPrice = parsePrice(targetData.lowest_price || "", targetCurrency);
-      if (!sourceData.success || !targetData.success || !sourcePrice || !targetPrice) {
-        throw new Error("Steam 未返回最低售价");
+      let sourcePrice = parsePrice(sourceData.lowest_price || "", currency.code);
+      let targetPrice = parsePrice(targetData.lowest_price || "", targetCurrency);
+      let quoteSource = "priceoverview";
+      if (!sourcePrice || !targetPrice) {
+        quoteSource = "orderbook";
+        if (sameCurrency) {
+          sourcePrice = await loadOrderBookLowest(sourceCurrencyId, currency.code);
+          targetPrice = sourcePrice;
+        } else {
+          [sourcePrice, targetPrice] = await Promise.all([
+            loadOrderBookLowest(sourceCurrencyId, currency.code),
+            loadOrderBookLowest(targetCurrencyId, targetCurrency)
+          ]);
+        }
       }
+      if (!sourcePrice || !targetPrice) throw new Error("Steam 未返回最低售价");
       const rate = calculateSteamRate(sourcePrice, targetPrice);
       if (!rate) throw new Error("Steam 换算率无效");
       steamRates.set(key, rate);
+      GM_setValue(cachedRateKey(currency.code, targetCurrency), {
+        rate,
+        updatedAt: Date.now()
+      });
       const sourceNet = sellerNetFromGross(sourcePrice);
       steamLowestQuotes.set(key, {
         itemKey: `${item.appid}:${item.marketHashName}`,
         sourceGross: sourcePrice,
         targetGross: targetPrice,
-        targetNet: Number.isFinite(sourceNet) ? sourceNet * rate : null
+        targetNet: Number.isFinite(sourceNet) ? sourceNet * rate : null,
+        quoteSource
       });
+      writeCachedLowest(currency.code, item, sourcePrice);
       rateStates.set(key, "ready");
       updateConversionHint(
         targetCurrency,
@@ -330,12 +430,18 @@
           : `Steam 换算：1 ${currency.code} ≈ ${rate.toFixed(6)} ${targetCurrency}`
       );
     } catch (error) {
-      rateStates.set(key, "error");
-      updateConversionHint(
-        targetCurrency,
-        `Steam 换算获取失败：${error.message || error}`,
-        true
-      );
+      const cachedRate = steamRates.get(key);
+      if (Number.isFinite(cachedRate) && cachedRate > 0) {
+        rateStates.set(key, "ready");
+        updateConversionHint(targetCurrency, "当前物品无报价，使用最近一次 Steam 换算率");
+      } else {
+        rateStates.set(key, "error");
+        updateConversionHint(
+          targetCurrency,
+          `Steam 换算获取失败：${error.message || error}`,
+          true
+        );
+      }
     }
     renderRows(currency);
   }
@@ -452,8 +558,8 @@
       }
       #${SCRIPT_ID}-lowest-fallback {
         box-sizing: border-box; display: grid; grid-template-columns: 1fr auto;
-        gap: 8px 18px; margin: 10px 0; padding: 14px 16px;
-        color: #8f98a0; background: #101923; border: 1px solid #2a475e;
+        gap: 8px 18px; margin: 0 0 12px; padding: 16px 18px;
+        color: #8f98a0; background: rgba(0, 0, 0, 0.2);
         border-left: 3px solid #66c0f4; font: 13px/1.4 Arial, Helvetica, sans-serif;
       }
       #${SCRIPT_ID}-lowest-fallback .${SCRIPT_ID}-fallback-title {
@@ -467,9 +573,10 @@
         grid-column: 1 / -1; color: #71808d; font-size: 11px;
       }
       .${SCRIPT_ID}-result.${SCRIPT_ID}-owned-result {
-        right: auto; left: 18%; width: 240px; padding: 5px 8px;
-        grid-template-columns: 34px minmax(0, 1fr) 34px minmax(0, 1fr);
-        gap: 2px 6px;
+        position: absolute; top: 50%; right: calc(17% + 2px); width: 138px;
+        max-width: none; margin: 0; padding: 4px 5px; transform: translateY(-50%);
+        grid-template-columns: 14px minmax(0, 1fr) 14px minmax(0, 1fr);
+        gap: 2px 3px; font-size: 10px; line-height: 1.25;
         pointer-events: auto;
       }
       .${SCRIPT_ID}-owned-result .${SCRIPT_ID}-result-title { display: none; }
@@ -497,7 +604,8 @@
         }
         .${SCRIPT_ID}-result-title { display: none; }
         .${SCRIPT_ID}-result.${SCRIPT_ID}-owned-result {
-          right: auto; left: 136px; width: 250px;
+          position: absolute; right: calc(17% + 2px); left: auto; top: 50%;
+          bottom: auto; width: 138px; margin: 0; transform: translateY(-50%);
         }
         .${SCRIPT_ID}-result .${SCRIPT_ID}-ratio-label { grid-column: 1; }
         .${SCRIPT_ID}-result .${SCRIPT_ID}-ratio { grid-column: 2 / -1; text-align: left; }
@@ -587,19 +695,60 @@
     const id = `${SCRIPT_ID}-lowest-fallback`;
     const existing = document.getElementById(id);
     const item = marketItem();
-    const container = document.getElementById("searchResultsRows");
-    const emptyMessage = container?.textContent || "";
-    const confirmsEmpty = /不在货架|没有.*(?:出售|在售)|no listings|not.*listed/i.test(
-      emptyMessage
-    );
-    if (!item || !container || visibleListingCount > 0 || !confirmsEmpty) {
+    const root = document.getElementById("searchResults")
+      || document.getElementById("searchResultsRows")
+      || document.body;
+    const candidates = [...document.querySelectorAll(
+      ".market_listing_table_message, div, p, span"
+    )].filter((node) => isNoListingMessage(node.textContent))
+      .sort((left, right) =>
+        normalizeMessage(left.textContent).length
+        - normalizeMessage(right.textContent).length
+      );
+    let messageBlock = candidates.find((node) =>
+      node.classList?.contains("market_listing_table_message")
+    ) || candidates[0] || null;
+
+    if (messageBlock && root) {
+      const messageText = normalizeMessage(messageBlock.textContent);
+      while (
+        messageBlock.parentElement
+        && messageBlock.parentElement !== root
+        && messageBlock.parentElement.id !== "searchResultsRows"
+        && normalizeMessage(messageBlock.parentElement.textContent) === messageText
+      ) {
+        messageBlock = messageBlock.parentElement;
+      }
+    }
+
+    const orderSpread = document.getElementById("market_commodity_order_spread");
+    const fallbackParent = messageBlock?.parentElement || orderSpread;
+    const fallbackAnchor = messageBlock || orderSpread?.firstElementChild || null;
+    if (!item || !fallbackParent || visibleListingCount > 0) {
       existing?.remove();
       return;
     }
 
     const key = rateKey(currency.code, target);
-    const lowest = steamLowestQuotes.get(key);
+    let lowest = steamLowestQuotes.get(key);
     if (!lowest || lowest.itemKey !== `${item.appid}:${item.marketHashName}`) {
+      const sourceGross = readCachedLowest(currency.code, item);
+      const rate = steamRates.get(key);
+      const sourceNet = sellerNetFromGross(sourceGross);
+      lowest = Number.isFinite(sourceGross) && sourceGross > 0
+        && Number.isFinite(sourceNet) && sourceNet > 0
+        && Number.isFinite(rate) && rate > 0
+        ? {
+          itemKey: `${item.appid}:${item.marketHashName}`,
+          sourceGross,
+          targetGross: sourceGross * rate,
+          targetNet: sourceNet * rate,
+          cached: true
+        }
+        : null;
+      if (lowest) steamLowestQuotes.set(key, lowest);
+    }
+    if (!lowest) {
       existing?.remove();
       return;
     }
@@ -615,24 +764,35 @@
         ? "税后价不可用"
         : "未填买入价";
     const signature = JSON.stringify([
-      lowest.targetGross, lowest.targetNet, buyPrice, target, ratio
+      lowest.targetGross, lowest.targetNet, buyPrice, target, ratio,
+      lowest.cached, lowest.quoteSource
     ]);
     const fallback = existing || document.createElement("div");
-    if (fallback.dataset.signature === signature) return;
     fallback.id = id;
-    fallback.dataset.signature = signature;
-    fallback.innerHTML = `
-      <div class="${SCRIPT_ID}-fallback-title">无可见卖单 · Steam 最低价参考</div>
-      <div class="${SCRIPT_ID}-fallback-values">
-        <span>含费最低 <strong class="${SCRIPT_ID}-gross">${formatMoney(lowest.targetGross, target)}</strong></span>
-        <span>税后估算 <strong class="${SCRIPT_ID}-net">${formatMoney(lowest.targetNet, target)}</strong></span>
-        <span>挂刀 <strong class="${SCRIPT_ID}-ratio ${ratioClass(ratio)}">${ratioText}</strong></span>
-      </div>
-      <div class="${SCRIPT_ID}-fallback-note">
-        数据来自 Steam priceoverview；税后价按当前钱包手续费反推，卖单恢复后以实际挂单为准。
-      </div>
-    `;
-    if (!existing) container.insertBefore(fallback, container.firstChild);
+    if (fallback.dataset.signature !== signature) {
+      fallback.dataset.signature = signature;
+      fallback.innerHTML = `
+        <div class="${SCRIPT_ID}-fallback-title">Steam 市场最低售价参考</div>
+        <div class="${SCRIPT_ID}-fallback-values">
+          <span>含费最低 <strong class="${SCRIPT_ID}-gross">${formatMoney(lowest.targetGross, target)}</strong></span>
+          <span>税后估算 <strong class="${SCRIPT_ID}-net">${formatMoney(lowest.targetNet, target)}</strong></span>
+          <span>挂刀 <strong class="${SCRIPT_ID}-ratio ${ratioClass(ratio)}">${ratioText}</strong></span>
+        </div>
+        <div class="${SCRIPT_ID}-fallback-note">
+          ${lowest.cached
+            ? "最低售价来自已上架列表缓存；"
+            : lowest.quoteSource === "orderbook"
+              ? "最低售价来自 Steam 订单深度；"
+              : "数据来自 Steam priceoverview；"}税后价按当前钱包手续费反推，卖单恢复后以实际挂单为准。
+        </div>
+      `;
+    }
+    if (
+      fallback.parentElement !== fallbackParent
+      || (fallbackAnchor && fallback.nextElementSibling !== fallbackAnchor)
+    ) {
+      fallbackParent.insertBefore(fallback, fallbackAnchor);
+    }
   }
 
   function renderRows(currency) {
@@ -642,8 +802,10 @@
     const key = rateKey(currency.code, target);
     const rate = steamRates.get(key);
     const state = rateStates.get(key) || "loading";
-    const visibleListingCount = document.querySelectorAll(
+    const visibleListingCount = [...document.querySelectorAll(
       "#searchResultsRows .market_listing_row"
+    )].filter((row) =>
+      row.getClientRects().length > 0 && listingAmounts(row, currency.code)
     ).length;
 
     document.querySelectorAll(
@@ -658,12 +820,21 @@
         "#tabContentsMyActiveMarketListingsRows, #myListings"
       ));
       const rowItem = marketItemFromRow(row) || marketItem();
+      if (owned && rowItem) {
+        const minimum = row.querySelector(".market_listing_minimum--text")
+          || row.querySelector(".market_listing_minimum");
+        const minimumPrice = parsePrice(minimum?.textContent || "", currency.code);
+        writeCachedLowest(currency.code, rowItem, minimumPrice);
+      }
       const buyPrice = currentBuyPrice(target, rowItem);
-      let result = row.querySelector(`:scope > .${SCRIPT_ID}-result`);
+      const resultHost = row;
+      let result = row.querySelector(`.${SCRIPT_ID}-result`);
       if (!result) {
         result = document.createElement("div");
         result.className = `${SCRIPT_ID}-result`;
-        row.appendChild(result);
+        resultHost.appendChild(result);
+      } else if (result.parentElement !== resultHost) {
+        resultHost.appendChild(result);
       }
       result.classList.toggle(`${SCRIPT_ID}-owned-result`, owned);
 
@@ -693,13 +864,13 @@
         : "—";
       if (owned) {
         result.innerHTML = `
-          <span class="${SCRIPT_ID}-result-label">含费</span>
+          <span class="${SCRIPT_ID}-result-label" title="买家含费价">含</span>
           <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-gross">${formatMoney(quote.convertedGross, target)}</span>
-          <span class="${SCRIPT_ID}-result-label">到账</span>
+          <span class="${SCRIPT_ID}-result-label" title="卖家到账价">到</span>
           <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-net">${formatMoney(quote.convertedNet, target)}</span>
-          <span class="${SCRIPT_ID}-result-label">买入</span>
+          <span class="${SCRIPT_ID}-result-label" title="买入成本">买</span>
           <input class="${SCRIPT_ID}-owned-buy" type="number" min="0" step="0.01" inputmode="decimal" aria-label="${target} 买入价">
-          <span class="${SCRIPT_ID}-result-label">挂刀</span>
+          <span class="${SCRIPT_ID}-result-label" title="挂刀比例">刀</span>
           <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-ratio ${ratioClass(quote.ratio)}">${ratioText}</span>
         `;
         const buyInput = result.querySelector(`.${SCRIPT_ID}-owned-buy`);

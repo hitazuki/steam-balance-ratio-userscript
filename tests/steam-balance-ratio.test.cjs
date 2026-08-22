@@ -20,6 +20,15 @@ assert.deepEqual(
 );
 assert.equal(script.marketItemFromUrl("https://steamcommunity.com/market/"), null);
 
+assert.equal(script.isNoListingMessage("此物品不在货架上。"), true);
+assert.equal(script.isNoListingMessage("提示：此物品不在货架上。"), true);
+assert.equal(script.isNoListingMessage("  目前无人挂出此物品。 "), true);
+assert.equal(
+  script.isNoListingMessage("There are no listings currently available for this item."),
+  true
+);
+assert.equal(script.isNoListingMessage("3841656 人请求购买"), false);
+
 assert.equal(script.parsePrice("P3757.93", "PHP"), 3757.93);
 assert.equal(script.parsePrice("₱3,757.93", "PHP"), 3757.93);
 assert.equal(script.parsePrice("3.757,93 €", "EUR"), 3757.93);

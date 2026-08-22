@@ -8,8 +8,9 @@
 ## 安装
 
 1. 在 Chrome、Edge 或 Firefox 安装 Tampermonkey。
-2. 打开 [脚本 Raw 地址](https://raw.githubusercontent.com/hitazuki/steam-balance-ratio-userscript/main/steam-balance-ratio.user.js)
-   并确认安装；仓库尚未推送时也可以在 Tampermonkey 中新建脚本并粘贴文件内容。
+2. 打开 [Greasy Fork 脚本页面](https://greasyfork.org/zh-CN/scripts/592475-steam-%E5%B8%82%E5%9C%BA%E8%B4%A7%E5%B8%81%E6%8D%A2%E7%AE%97%E4%B8%8E%E6%8C%82%E5%88%80%E6%AF%94%E4%BE%8B)
+   并点击“安装此脚本”；也可以从 [GitHub Raw 地址](https://raw.githubusercontent.com/hitazuki/steam-balance-ratio-userscript/main/steam-balance-ratio.user.js)
+   直接安装。
 3. 登录浏览器版 Steam，打开形如
    `https://steamcommunity.com/market/listings/730/...` 的饰品页面。
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 市场货币换算与挂刀比例
 // @namespace    https://github.com/hitazuki/steam-balance-ratio-userscript
-// @version      0.2.0
+// @version      0.2.1
 // @description  使用 Steam 自身的货币换算，在饰品挂单旁显示目标货币金额和税后挂刀比例。
 // @author       hitazuki
 // @license      MIT
@@ -346,18 +346,47 @@
         color: #66c0f4; background: #101923; border: 1px solid #344c61; border-radius: 3px;
       }
       #${SCRIPT_ID}-toolbar .${SCRIPT_ID}-hint { align-self: center; color: #8f98a0; font-size: 12px; }
-      .${SCRIPT_ID}-result { margin-top: 4px; white-space: nowrap; font-size: 12px; line-height: 1.45; }
-      .${SCRIPT_ID}-gross { color: #8f98a0; }
+      #searchResultsRows .market_listing_row { position: relative; }
+      .${SCRIPT_ID}-result {
+        box-sizing: border-box; position: absolute; z-index: 2; top: 50%; right: 350px;
+        width: 190px; transform: translateY(-50%); display: grid;
+        grid-template-columns: 48px minmax(0, 1fr); gap: 3px 8px; padding: 8px 10px;
+        color: #8f98a0; background: rgba(15, 27, 39, 0.78);
+        border-left: 2px solid #2a475e; border-radius: 3px;
+        white-space: nowrap; font: 12px/1.35 Arial, Helvetica, sans-serif;
+        pointer-events: none;
+      }
+      .${SCRIPT_ID}-result-title {
+        grid-column: 1 / -1; margin-bottom: 1px; color: #8f98a0;
+        font-size: 11px; letter-spacing: .04em;
+      }
+      .${SCRIPT_ID}-result-label { color: #71808d; }
+      .${SCRIPT_ID}-result-value {
+        min-width: 0; overflow: hidden; text-align: right; text-overflow: ellipsis;
+        font-variant-numeric: tabular-nums;
+      }
+      .${SCRIPT_ID}-gross { color: #c7d5e0; }
       .${SCRIPT_ID}-net { color: #66c0f4; }
       .${SCRIPT_ID}-ratio { font-weight: 600; }
       .${SCRIPT_ID}-ratio.good { color: #8bc53f; }
       .${SCRIPT_ID}-ratio.warn { color: #e5b54b; }
       .${SCRIPT_ID}-ratio.bad { color: #e35e5e; }
       .${SCRIPT_ID}-ratio.missing { color: #8f98a0; }
+      .${SCRIPT_ID}-result.${SCRIPT_ID}-message {
+        grid-template-columns: 1fr; text-align: center;
+      }
       @media (max-width: 760px) {
         #${SCRIPT_ID}-toolbar { align-items: stretch; }
         #${SCRIPT_ID}-toolbar .${SCRIPT_ID}-field { flex: 1 1 140px; }
         #${SCRIPT_ID}-toolbar input, #${SCRIPT_ID}-toolbar select { width: 100%; }
+        .${SCRIPT_ID}-result {
+          top: auto; right: auto; bottom: 6px; left: 136px; width: 250px;
+          transform: none; grid-template-columns: 40px 1fr 40px 1fr;
+          gap: 2px 6px; padding: 5px 8px;
+        }
+        .${SCRIPT_ID}-result-title { display: none; }
+        .${SCRIPT_ID}-result .${SCRIPT_ID}-ratio-label { grid-column: 1; }
+        .${SCRIPT_ID}-result .${SCRIPT_ID}-ratio { grid-column: 2 / -1; text-align: left; }
       }
     `;
     document.head.appendChild(style);
@@ -435,12 +464,12 @@
     document.querySelectorAll("#searchResultsRows .market_listing_row").forEach((row) => {
       const amounts = listingAmounts(row, currency.code);
       if (!amounts) return;
-      const { gross, net, host } = amounts;
-      let result = host.querySelector(`.${SCRIPT_ID}-result`);
+      const { gross, net } = amounts;
+      let result = row.querySelector(`:scope > .${SCRIPT_ID}-result`);
       if (!result) {
         result = document.createElement("div");
         result.className = `${SCRIPT_ID}-result`;
-        host.appendChild(result);
+        row.appendChild(result);
       }
 
       const quote = Number.isFinite(rate)
@@ -451,19 +480,28 @@
       result.dataset.signature = signature;
 
       if (!quote) {
+        result.classList.add(`${SCRIPT_ID}-message`);
         const message = state === "error"
           ? "Steam 换算获取失败"
           : state === "ready"
             ? "Steam 换算数据不可用"
             : "正在获取 Steam 换算…";
-        result.innerHTML = `<span class="${SCRIPT_ID}-ratio missing">${message}</span>`;
+        result.innerHTML = `
+          <span class="${SCRIPT_ID}-result-title">${target} 折合</span>
+          <span class="${SCRIPT_ID}-ratio missing">${message}</span>
+        `;
         return;
       }
+      result.classList.remove(`${SCRIPT_ID}-message`);
       const ratioText = Number.isFinite(quote.ratio) ? `${quote.ratio.toFixed(2)}%` : "—";
       result.innerHTML = `
-        <div class="${SCRIPT_ID}-gross">含费折合 ${formatMoney(quote.convertedGross, target)}</div>
-        <div class="${SCRIPT_ID}-net">到账折合 ${formatMoney(quote.convertedNet, target)}</div>
-        <div class="${SCRIPT_ID}-ratio ${ratioClass(quote.ratio)}">挂刀比例 ${ratioText}</div>
+        <span class="${SCRIPT_ID}-result-title">${target} 折合</span>
+        <span class="${SCRIPT_ID}-result-label">含费</span>
+        <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-gross">${formatMoney(quote.convertedGross, target)}</span>
+        <span class="${SCRIPT_ID}-result-label">到账</span>
+        <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-net">${formatMoney(quote.convertedNet, target)}</span>
+        <span class="${SCRIPT_ID}-result-label ${SCRIPT_ID}-ratio-label">挂刀</span>
+        <span class="${SCRIPT_ID}-result-value ${SCRIPT_ID}-ratio ${ratioClass(quote.ratio)}">${ratioText}</span>
       `;
     });
   }
